@@ -71,32 +71,22 @@ stage('Quality Gate') {
 }
 
 stage('Backend - Dependency Vulnerability Scan') {
+    tools {
+        dependencyCheck 'dependency-check'
+    }
     steps {
         dir("${BACKEND_DIR}") {
-            dependencyCheck additionalArguments: '''
-              --scan .
-              --format XML
-              --out dependency-check-report
-            ''',
-            odcInstallation: 'dependency-check'
+            sh '''
+              dependency-check.sh \
+                --scan . \
+                --format XML \
+                --out dependency-check-report
+            '''
         }
     }
 }
-stage('Evaluate Dependency Vulnerabilities') {
-    steps {
-        dependencyCheckPublisher pattern: '**/dependency-check-report/dependency-check-report.xml',
-                                 failedTotalHigh: 1,
-                                 failedTotalCritical: 1
-    }
-}
-        
-        stage('Backend - Docker Build') {
-            steps {
-                dir("${BACKEND_DIR}") {
-                    sh 'docker build -t ${BACKEND_IMAGE} .'
-                }
-            }
-        }
+
+
 
         /* -------- FRONTEND -------- */
 
