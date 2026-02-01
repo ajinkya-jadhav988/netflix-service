@@ -33,13 +33,17 @@ pipeline {
 
         /* -------- BACKEND -------- */
 
-        stage('Backend - Maven Build') {
-            steps {
-                dir("${BACKEND_DIR}") {
-                    sh 'mvn clean verify'
-                }
-            }
+stage('Backend - Maven Build') {
+    tools {
+        maven 'maven-3.9'
+    }
+    steps {
+        dir("${BACKEND_DIR}") {
+            sh 'mvn clean verify'
         }
+    }
+}
+
 
         stage('Backend - Sonar Scan') {
             steps {
