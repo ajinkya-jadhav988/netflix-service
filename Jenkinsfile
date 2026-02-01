@@ -45,15 +45,31 @@ stage('Backend - Maven Build') {
 }
 
 
-        stage('Backend - Sonar Scan') {
-            steps {
-                dir("${BACKEND_DIR}") {
-                    sh '''
-                      echo "Sonar scan configured via Jenkins tools"
-                    '''
-                }
+stage('Backend - Sonar Scan') {
+    tools {
+        maven 'maven-3.9'
+    }
+    steps {
+        dir("${BACKEND_DIR}") {
+            withSonarQubeEnv('sonar-server') {
+                sh '''
+                  mvn sonar:sonar \
+                    -Dsonar.projectKey=netflix-backend \
+                    -Dsonar.projectName=netflix-backend
+                '''
             }
         }
+    }
+}
+
+stage('Quality Gate') {
+    steps {
+        timeout(time: 2, unit: 'MINUTES') {
+            waitForQualityGate abortPipeline: true
+        }
+    }
+}
+
 
         stage('Backend - Docker Build') {
             steps {
