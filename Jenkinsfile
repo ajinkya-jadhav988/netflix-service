@@ -72,7 +72,7 @@ stage('Quality Gate') {
 
 stage('Backend - Dependency Vulnerability Scan') {
     tools {
-        dependencyCheck 'dependency-check'
+        'dependency-check' 'dependency-check'
     }
     steps {
         dir("${BACKEND_DIR}") {
@@ -85,6 +85,7 @@ stage('Backend - Dependency Vulnerability Scan') {
         }
     }
 }
+
 
 
 
