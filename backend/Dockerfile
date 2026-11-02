@@ -9,7 +9,7 @@ COPY src ./src
 RUN mvn -B clean verify
 
 # ---- Stage 2: minimal runtime image, non-root ----
-FROM eclipse-temurin:17-jre-alpine
+FROM eclipse-temurin:25-jre-alpine
 RUN addgroup -S -g 10001 app && adduser -S -u 10001 -G app app
 WORKDIR /app
 COPY --from=build /build/target/catalog-service-1.0.0.jar app.jar
