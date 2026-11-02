@@ -1,0 +1,125 @@
+name: CI
+
+# Runs on every pull request and push to main, and is also reused by the deploy workflow.
+# It needs NO AWS access: everything here is static checks and local builds.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TERRAFORM_VERSION: "1.17.1"
+
+jobs:
+  terraform:
+    name: Terraform checks (${{ matrix.dir }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [bootstrap, infra]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Format check
+        run: terraform fmt -check -recursive -diff
+        working-directory: ${{ matrix.dir }}
+
+      - name: Init (no backend) and validate
+        working-directory: ${{ matrix.dir }}
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+
+      - name: TFLint
+        run: tflint --chdir=${{ matrix.dir }} --format compact
+
+      # Plans the full stack against a mocked AWS provider and asserts the guardrails (no AWS access needed).
+      - name: Terraform unit tests (mocked provider)
+        if: matrix.dir == 'infra'
+        working-directory: infra
+        run: terraform test
+
+  security:
+    name: Security scans
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Misconfiguration scan of Terraform, Kubernetes manifests and Dockerfiles.
+      - name: Trivy - IaC misconfiguration (fails on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          hide-progress: true
+
+      # Hard-coded secrets / keys anywhere in the repo. pom.xml is skipped so a secret scan never
+      # depends on (or gets rate-limited by) Maven Central dependency resolution.
+      - name: Trivy - secret scan (fails on any secret)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          skip-files: backend/pom.xml
+          exit-code: "1"
+          hide-progress: true
+
+  kubernetes:
+    name: Kubernetes manifests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Render with kustomize and validate against the Kubernetes API schemas
+        run: |
+          kubectl kustomize k8s > rendered.yaml
+          docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 \
+            -strict -summary -ignore-missing-schemas -kubernetes-version 1.35.0 - < rendered.yaml
+
+  images:
+    name: Build and scan image (${{ matrix.app }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [backend, frontend]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The backend Dockerfile runs `mvn clean verify` inside Docker, so unit tests are part of the build
+      # and the runner needs no Java installation.
+      - name: Docker build
+        run: docker build --tag netflix-${{ matrix.app }}:ci ${{ matrix.app }}
+
+      - name: Trivy - image vulnerabilities (fails on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: netflix-${{ matrix.app }}:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          hide-progress: true

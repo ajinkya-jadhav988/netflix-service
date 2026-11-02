@@ -1,0 +1,85 @@
+name: Destroy (tear everything down)
+
+# MANUAL trigger only. Removes the app, the ALB and ALL Terraform-managed AWS resources so the bill stops.
+# It does NOT remove the bootstrap resources (state bucket, IAM roles, budget); see the README for that.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to confirm'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aws-netflix-infra
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: "1.17.1"
+  TF_VAR_region: ${{ vars.AWS_REGION }}
+  TF_VAR_extra_admin_arns: ${{ vars.EXTRA_ADMIN_ARNS || '[]' }}
+
+jobs:
+  destroy:
+    name: Destroy
+    # Guardrails: must be typed explicitly, only from main, and still needs the environment approval.
+    if: inputs.confirm == 'destroy' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment:
+      name: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 7200
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - uses: ./.github/actions/tf-init
+        with:
+          working-directory: infra
+          bucket: ${{ vars.TF_STATE_BUCKET }}
+          region: ${{ vars.AWS_REGION }}
+          kms-key-arn: ${{ vars.TF_STATE_KMS_KEY_ARN }}
+
+      # The ALB and its security groups are created by the Load Balancer Controller, NOT by Terraform.
+      # If the cluster were destroyed first they would be orphaned and block deletion of the VPC.
+      # So: delete the Ingress objects (the controller deletes the ALB), then remove the controller.
+      - name: Remove ALB and application from the cluster
+        run: |
+          CLUSTER=$(terraform -chdir=infra output -raw cluster_name 2>/dev/null || echo "netflix-eks")
+          if ! aws eks describe-cluster --name "$CLUSTER" >/dev/null 2>&1; then
+            echo "Cluster $CLUSTER not found - nothing to clean inside Kubernetes."
+            exit 0
+          fi
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER"
+          kubectl delete ingress --all -n netflix --wait=true --timeout=10m || true
+          kubectl delete namespace netflix --wait=true --timeout=10m || true
+          helm uninstall aws-load-balancer-controller -n kube-system --wait || true
+          echo "Giving AWS a moment to release the ALB network interfaces..."
+          sleep 60
+
+      - name: terraform destroy
+        working-directory: infra
+        run: |
+          for attempt in 1 2 3; do
+            if terraform destroy -auto-approve -input=false -no-color -lock-timeout=10m; then
+              exit 0
+            fi
+            echo "destroy attempt $attempt failed (often leftover ENIs/security groups being released) - retrying in 90s"
+            sleep 90
+          done
+          exit 1

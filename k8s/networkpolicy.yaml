@@ -1,0 +1,31 @@
+# Guardrail: zero-trust networking inside the namespace. Enforced by the VPC CNI network policy agent
+# (enabled in infra/eks.tf through the vpc-cni add-on).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: netflix
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# The only allowed caller is the ALB. Its ENIs live in the PUBLIC subnets created by infra/network.tf
+# (10.0.200.0/24 and 10.0.201.0/24 with the default vpc_cidr). 10.0.200.0/22 covers up to 3 AZs.
+# If you change vpc_cidr in Terraform, change this CIDR to match.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-alb-to-apps
+  namespace: netflix
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 10.0.200.0/22
+      ports:
+        - protocol: TCP
+          port: 8080

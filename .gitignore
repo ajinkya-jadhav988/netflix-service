@@ -1,0 +1,23 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+override.tf
+override.tf.json
+*.auto.tfvars
+terraform.tfvars
+# (provider lock files .terraform.lock.hcl ARE committed on purpose)
+
+# Build output
+backend/target/
+rendered.yaml
+
+# Editors / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

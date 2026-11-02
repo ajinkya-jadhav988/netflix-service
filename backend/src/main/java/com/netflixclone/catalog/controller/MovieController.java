@@ -6,7 +6,6 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 
-@CrossOrigin(origins = "*")   // ✅ ADD THIS LINE
 @RestController
 @RequestMapping("/movies")
 public class MovieController {

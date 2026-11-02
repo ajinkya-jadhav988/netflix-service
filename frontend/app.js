@@ -1,5 +1,5 @@
-const API_URL = "http://65.2.3.52:8080/movies"; 
-// ⚠️ Use your EC2 PUBLIC IP (not localhost)
+// Same-origin relative path: the ALB Ingress routes /movies to the backend service.
+const API_URL = "/movies";
 
 fetch(API_URL)
   .then(response => response.json())

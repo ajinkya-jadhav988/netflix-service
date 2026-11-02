@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Keeps pinned action SHAs, Terraform modules/providers, base images and Maven deps current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+  - package-ecosystem: terraform
+    directory: "/infra"
+    schedule:
+      interval: weekly
+  - package-ecosystem: terraform
+    directory: "/bootstrap"
+    schedule:
+      interval: weekly
+  - package-ecosystem: maven
+    directory: "/backend"
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: "/backend"
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: "/frontend"
+    schedule:
+      interval: weekly

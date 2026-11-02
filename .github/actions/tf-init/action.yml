@@ -1,0 +1,32 @@
+name: Terraform init (S3 backend)
+description: Initialise Terraform with the remote state bucket created by bootstrap/.
+
+inputs:
+  working-directory:
+    description: Terraform root module directory.
+    required: true
+  bucket:
+    description: S3 bucket holding the state.
+    required: true
+  region:
+    description: AWS region of the bucket.
+    required: true
+  kms-key-arn:
+    description: KMS key that encrypts the state.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: terraform init
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TF_BUCKET: ${{ inputs.bucket }}
+        TF_REGION: ${{ inputs.region }}
+        TF_KMS: ${{ inputs.kms-key-arn }}
+      run: |
+        terraform init -input=false \
+          -backend-config="bucket=${TF_BUCKET}" \
+          -backend-config="region=${TF_REGION}" \
+          -backend-config="kms_key_id=${TF_KMS}"

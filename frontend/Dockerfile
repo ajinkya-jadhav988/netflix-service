@@ -1,11 +1,10 @@
-FROM nginx:alpine
+FROM nginxinc/nginx-unprivileged:stable-alpine
 
-# Remove default nginx static files
-RUN rm -rf /usr/share/nginx/html/*
+# Non-root (uid 101) nginx listening on 8080; custom site config + static files only
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY index.html app.js style.css /usr/share/nginx/html/
+COPY images /usr/share/nginx/html/images
 
-# Copy frontend files
-COPY . /usr/share/nginx/html/
-
-# Expose port 80
-EXPOSE 80
+USER 101
+EXPOSE 8080
 

@@ -1,0 +1,253 @@
+name: Deploy (provision AWS + run the app on EKS)
+
+# MANUAL trigger only (Actions tab -> "Deploy" -> Run workflow). Nothing is created on a plain push, so nothing can
+# silently start costing money.
+#
+#   preflight -> ci -> plan (read-only) -> [manual approval] -> deploy
+#
+# deploy = terraform apply (the exact saved plan) -> build+push images to ECR -> install the AWS Load Balancer
+# Controller -> apply Kubernetes manifests -> wait for the ALB -> smoke test.
+on:
+  workflow_dispatch:
+    inputs:
+      plan_only:
+        description: "Only show the Terraform plan. Do not create or change anything."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Guardrail: only one infrastructure operation (deploy/destroy) at a time; never cancel one half-way.
+concurrency:
+  group: aws-netflix-infra
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: "1.17.1"
+  LBC_CHART_VERSION: "3.6.2" # AWS Load Balancer Controller chart; matches infra/policies/*.json
+  TF_VAR_region: ${{ vars.AWS_REGION }}
+  TF_VAR_extra_admin_arns: ${{ vars.EXTRA_ADMIN_ARNS || '[]' }}
+
+jobs:
+  preflight:
+    name: Preflight (repository variables)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Guardrail: infrastructure can only be changed from main.
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Check required repository variables
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_KMS_KEY_ARN: ${{ vars.TF_STATE_KMS_KEY_ARN }}
+          AWS_PLAN_ROLE_ARN: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          missing=0
+          for v in AWS_REGION TF_STATE_BUCKET TF_STATE_KMS_KEY_ARN AWS_PLAN_ROLE_ARN AWS_DEPLOY_ROLE_ARN; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Repository variable $v is not set. Run bootstrap/ first (see README step 3) and add the variables."
+              missing=1
+            fi
+          done
+          exit $missing
+
+  ci:
+    name: CI checks
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  plan:
+    name: Terraform plan (read-only role)
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - uses: ./.github/actions/tf-init
+        with:
+          working-directory: infra
+          bucket: ${{ vars.TF_STATE_BUCKET }}
+          region: ${{ vars.AWS_REGION }}
+          kms-key-arn: ${{ vars.TF_STATE_KMS_KEY_ARN }}
+
+      - name: terraform plan
+        working-directory: infra
+        run: terraform plan -input=false -no-color -lock-timeout=10m -out=tfplan
+
+      - name: Show plan in the job summary
+        working-directory: infra
+        run: |
+          {
+            echo '### Terraform plan'
+            echo '```'
+            terraform show -no-color tfplan | head -c 60000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The deploy job applies exactly this file, so what was reviewed is what runs.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tfplan
+          path: infra/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+  deploy:
+    name: Apply + deploy to EKS
+    needs: plan
+    if: ${{ !inputs.plan_only }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # Guardrail: this environment holds the manual-approval gate and is the ONLY thing the deploy role trusts.
+    environment:
+      name: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 7200
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - uses: ./.github/actions/tf-init
+        with:
+          working-directory: infra
+          bucket: ${{ vars.TF_STATE_BUCKET }}
+          region: ${{ vars.AWS_REGION }}
+          kms-key-arn: ${{ vars.TF_STATE_KMS_KEY_ARN }}
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan
+          path: infra
+
+      - name: terraform apply (saved plan)
+        working-directory: infra
+        run: terraform apply -input=false -no-color -lock-timeout=10m tfplan
+
+      - name: Read Terraform outputs
+        working-directory: infra
+        run: |
+          terraform output -json > "$RUNNER_TEMP/outputs.json"
+          {
+            echo "CLUSTER_NAME=$(jq -r .cluster_name.value "$RUNNER_TEMP/outputs.json")"
+            echo "VPC_ID=$(jq -r .vpc_id.value "$RUNNER_TEMP/outputs.json")"
+            echo "LBC_ROLE_ARN=$(jq -r .lbc_role_arn.value "$RUNNER_TEMP/outputs.json")"
+            echo "BACKEND_REPO=$(jq -r .ecr_repository_urls.value.backend "$RUNNER_TEMP/outputs.json")"
+            echo "FRONTEND_REPO=$(jq -r .ecr_repository_urls.value.frontend "$RUNNER_TEMP/outputs.json")"
+            echo "IMAGE_TAG=${GITHUB_SHA::12}"
+          } >> "$GITHUB_ENV"
+
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Build and push images (skipped if this commit's tag already exists)
+        run: |
+          set -euo pipefail
+          for app in backend frontend; do
+            repo_url=$(jq -r ".ecr_repository_urls.value.${app}" "$RUNNER_TEMP/outputs.json")
+            repo_name="${repo_url##*/}"
+            if aws ecr describe-images --repository-name "$repo_name" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+              echo "$repo_name:$IMAGE_TAG already in ECR (tags are immutable) - skipping build"
+            else
+              docker build --tag "$repo_url:$IMAGE_TAG" "$app"
+              docker push "$repo_url:$IMAGE_TAG"
+            fi
+          done
+
+      - name: Configure kubectl and wait for cluster access
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+          # The EKS access entry for this role can take a short while to become effective.
+          for i in $(seq 1 30); do
+            if kubectl get namespaces >/dev/null 2>&1; then break; fi
+            echo "Waiting for cluster access ($i/30)..."; sleep 10
+          done
+          kubectl get nodes -o wide
+
+      - name: Install AWS Load Balancer Controller (turns Ingress into an ALB)
+        run: |
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            --namespace kube-system \
+            --version "$LBC_CHART_VERSION" \
+            --set clusterName="$CLUSTER_NAME" \
+            --set region="$AWS_REGION" \
+            --set vpcId="$VPC_ID" \
+            --set serviceAccount.create=true \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --set-string "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$LBC_ROLE_ARN" \
+            --wait --timeout 10m
+
+      - name: Deploy the application manifests
+        working-directory: k8s
+        run: |
+          kustomize edit set image \
+            "netflix-backend=${BACKEND_REPO}:${IMAGE_TAG}" \
+            "netflix-frontend=${FRONTEND_REPO}:${IMAGE_TAG}"
+          # The controller's admission webhook may need a few seconds after install; retry briefly.
+          for i in 1 2 3 4 5; do
+            kubectl apply -k . && break
+            echo "kubectl apply failed (attempt $i), retrying in 20s..."; sleep 20
+          done
+          kubectl -n netflix rollout status deployment/backend --timeout=5m
+          kubectl -n netflix rollout status deployment/frontend --timeout=5m
+
+      - name: Wait for the ALB and smoke test
+        run: |
+          HOST=""
+          for i in $(seq 1 60); do
+            HOST=$(kubectl -n netflix get ingress frontend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "$HOST" ] && break
+            echo "Waiting for ALB hostname ($i/60)..."; sleep 10
+          done
+          [ -n "$HOST" ] || { echo "::error::ALB hostname was not assigned in time"; exit 1; }
+          echo "ALB: $HOST"
+          curl -fsS --retry 40 --retry-delay 10 --retry-all-errors --max-time 10 "http://$HOST/movies"
+          echo
+          curl -fsS --retry 10 --retry-delay 10 --retry-all-errors --max-time 10 -o /dev/null "http://$HOST/"
+          {
+            echo "### Application is live"
+            echo ""
+            echo "Open: http://$HOST"
+            echo ""
+            echo "API: http://$HOST/movies"
+            echo ""
+            echo "Cost reminder: EKS + NAT + ALB cost money while running. Run the **Destroy** workflow when finished."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cluster diagnostics (only on failure)
+        if: failure()
+        run: |
+          kubectl -n netflix get pods,svc,ingress -o wide || true
+          kubectl -n netflix describe pods || true
+          kubectl -n netflix get events --sort-by=.lastTimestamp | tail -40 || true
+          kubectl -n kube-system logs deployment/aws-load-balancer-controller --tail=80 || true

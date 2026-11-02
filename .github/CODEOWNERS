@@ -1,0 +1,5 @@
+# Changes to the pipeline, infrastructure and IAM trust require review from the owner.
+/.github/   @ajinkya-jadhav988
+/infra/     @ajinkya-jadhav988
+/bootstrap/ @ajinkya-jadhav988
+/k8s/       @ajinkya-jadhav988

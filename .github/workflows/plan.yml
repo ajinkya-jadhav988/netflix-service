@@ -1,0 +1,73 @@
+name: Terraform plan (pull requests)
+
+# Shows reviewers exactly what a PR would change in AWS. Uses the READ-ONLY plan role (OIDC), never applies.
+# Skipped until bootstrap has been run and the repository variables exist, and skipped for fork PRs.
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/plan.yml"
+      - ".github/actions/tf-init/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    if: vars.AWS_PLAN_ROLE_ARN != '' && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      id-token: write # request the OIDC token
+      pull-requests: write # post the plan as a comment
+    env:
+      TF_VAR_region: ${{ vars.AWS_REGION }}
+      TF_VAR_extra_admin_arns: ${{ vars.EXTRA_ADMIN_ARNS || '[]' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+
+      - uses: ./.github/actions/tf-init
+        with:
+          working-directory: infra
+          bucket: ${{ vars.TF_STATE_BUCKET }}
+          region: ${{ vars.AWS_REGION }}
+          kms-key-arn: ${{ vars.TF_STATE_KMS_KEY_ARN }}
+
+      - name: terraform plan
+        working-directory: infra
+        run: terraform plan -input=false -no-color -lock-timeout=5m -out=tfplan
+
+      - name: Render plan
+        working-directory: infra
+        run: terraform show -no-color tfplan > ../plan.txt
+
+      - name: Comment plan on the PR
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            let plan = fs.readFileSync('plan.txt', 'utf8');
+            const max = 60000;
+            if (plan.length > max) plan = plan.slice(0, max) + '\n... (truncated, see the job log)';
+            const body = '### Terraform plan\n<details><summary>Show plan</summary>\n\n```hcl\n' + plan + '\n```\n</details>';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
